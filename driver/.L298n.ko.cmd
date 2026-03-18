@@ -1,0 +1,1 @@
+cmd_/home/xy/linux/feedCat/driver/L298n.ko := arm-linux-gnueabihf-ld -EL -r  -T ./scripts/module-common.lds --build-id  -o /home/xy/linux/feedCat/driver/L298n.ko /home/xy/linux/feedCat/driver/L298n.o /home/xy/linux/feedCat/driver/L298n.mod.o

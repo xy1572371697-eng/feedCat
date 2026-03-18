@@ -1,0 +1,1 @@
+cmd_/home/xy/linux/feedCat/driver/tcrt5000.ko := arm-linux-gnueabihf-ld -EL -r  -T ./scripts/module-common.lds --build-id  -o /home/xy/linux/feedCat/driver/tcrt5000.ko /home/xy/linux/feedCat/driver/tcrt5000.o /home/xy/linux/feedCat/driver/tcrt5000.mod.o

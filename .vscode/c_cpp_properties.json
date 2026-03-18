@@ -1,0 +1,31 @@
+{
+    "configurations": [
+        {
+            "name": "Linux-ARM-Kernel",
+            "includePath": [
+                "${workspaceFolder}/**",
+                "/home/xy/linux/alientek_linux/linux-imx-4.1.15-2.1.0-e48931b1-v2.8/include",
+                "/home/xy/linux/alientek_linux/linux-imx-4.1.15-2.1.0-e48931b1-v2.8/arch/arm/include",
+                "/home/xy/linux/alientek_linux/linux-imx-4.1.15-2.1.0-e48931b1-v2.8/arch/arm/include/generated",
+                "/home/xy/linux/alientek_linux/linux-imx-4.1.15-2.1.0-e48931b1-v2.8/"
+            ],
+            "defines": [
+                "__KERNEL__",
+                "MODULE",
+                "CONFIG_ARM",
+                "__LINUX_ARM_ARCH__=7",
+                "CONFIG_CROSS_COMPILE"
+            ],
+            "compilerPath": "/usr/local/arm/gcc-linaro-4.9.4-2017.01-x86_64_arm-linux-gnueabihf/bin/arm-linux-gnueabihf-gcc",
+            "cStandard": "gnu11",
+            "cppStandard": "gnu++14",
+            "intelliSenseMode": "linux-gcc-arm",
+            "compilerArgs": [
+                "-march=armv7-a",
+                "-mfpu=neon-vfpv4",
+                "-mfloat-abi=hard"
+            ]
+        }
+    ],
+    "version": 4
+}

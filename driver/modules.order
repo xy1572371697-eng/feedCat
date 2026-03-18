@@ -1,0 +1,3 @@
+kernel//home/xy/linux/feedCat/driver/HX711.ko
+kernel//home/xy/linux/feedCat/driver/L298n.ko
+kernel//home/xy/linux/feedCat/driver/tcrt5000.ko
