@@ -1,6 +1,6 @@
 KERNELDIR := /home/xy/linux/alientek_linux/linux-imx-4.1.15-2.1.0-e48931b1-v2.8
 CURRENT_PATH := $(shell pwd)
-obj-m := HX711.o L298n.o tcrt5000.o
+obj-m := HX711.o L298n.o tcrt5000.o feedcat_kprobes.o
 
 build: kernel_modules
 

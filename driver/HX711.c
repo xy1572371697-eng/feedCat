@@ -12,7 +12,9 @@
 #include <linux/cdev.h>
 #include <linux/platform_device.h>
 #include <linux/jiffies.h>
-#include <linux/types.h>  // 添加这个
+#include <linux/types.h>
+#include <linux/debugfs.h>
+#include <linux/atomic.h>
 
 /************************ 全局配置 ************************/
 #define WEIGHT_DEV_NAME      "weight_sensor"
@@ -25,10 +27,10 @@
 typedef struct {
     int                gpio_dt;
     int                gpio_sck;
-    int                calibration;   // 校准系数（32位足够）
-    int                offset;         // 零点偏移（32位足够）
+    int                calibration;    /* 校准系数 */
+    int                offset;         /* 零点偏移 */
     int                low_threshold;
-    int                raw_data;       // 改用 int 存储原始值（24位足够）
+    int                raw_data;       /* 最近原始值(24位) */
     int                current_weight;
     struct mutex       mutex;
     dev_t              devid;
@@ -37,6 +39,11 @@ typedef struct {
     struct device      *device;
     struct device_node *nd;
     struct platform_device *pdev;
+    /* Debugfs: 运行时诊断接口 */
+    struct dentry      *debugfs_dir;
+    atomic_t           sample_count;   /* 累计采样次数 */
+    atomic_t           error_count;    /* 累计采样错误次数 */
+    u32                last_raw_u32;   /* debugfs 只读原始值 */
 } weight_platform_dev_t;
 
 static weight_platform_dev_t *weight_dev;
@@ -75,15 +82,13 @@ static int hx711_read_raw(weight_platform_dev_t *dev)
     }
     mutex_unlock(&dev->mutex);
 
-    // 组合24位数据
     value = (data[0] << 16) | (data[1] << 8) | data[2];
-    
-    // 24位补码转有符号整数
-    if (value & 0x800000) {
-        value |= 0xFF000000;  // 扩展符号位到32位
-    }
+    if (value & 0x800000)
+        value |= 0xFF000000;
 
-    dev->raw_data = value;
+    dev->raw_data    = value;
+    dev->last_raw_u32 = (u32)value;
+    atomic_inc(&dev->sample_count);
     return value;
 }
 
@@ -95,18 +100,18 @@ int weight_get(void)
     if (!weight_dev) return -1;
 
     raw = hx711_read_raw(weight_dev);
-    if (raw < 0) return -1;
+    if (raw < 0) {
+        atomic_inc(&weight_dev->error_count);
+        return -1;
+    }
 
-    // 直接用32位除法，没问题！
     weight = (raw - weight_dev->offset) / weight_dev->calibration;
     weight = weight < 0 ? 0 : weight;
-
     weight_dev->current_weight = weight;
 
-    if (weight < weight_dev->low_threshold) {
-        pr_warn("[weight] 缺粮警告！当前重量：%d克（阈值：%d克）\n", 
+    if (weight < weight_dev->low_threshold)
+        pr_warn("[weight] 缺粮警告！当前重量：%d克（阈值：%d克）\n",
                 weight, weight_dev->low_threshold);
-    }
 
     pr_info("[weight] 实时重量：%d克（原始值：%d）\n", weight, raw);
     return weight;
@@ -126,9 +131,8 @@ static void weight_calib_zero(weight_platform_dev_t *dev)
         sum += hx711_read_raw(dev);
         msleep(10);
     }
-    dev->offset = sum / count;  // 32位除法
+    dev->offset = sum / count;
     mutex_unlock(&dev->mutex);
-
     pr_info("[weight] 零点校准完成，偏移值：%d\n", dev->offset);
 }
 
@@ -137,6 +141,40 @@ static void weight_set_calibration(weight_platform_dev_t *dev, int cali)
     if (!dev || cali <= 0) return;
     dev->calibration = cali;
     pr_info("[weight] 校准系数已设置：%d\n", cali);
+}
+
+/************************ Debugfs 接口 ************************/
+/*
+ * 通过 Debugfs 向用户态暴露驱动内部状态，无需修改业务代码即可运行时诊断。
+ * 查看方式：
+ *   cat /sys/kernel/debug/hx711_weight/raw_adc        # 最近一次 ADC 原始值
+ *   cat /sys/kernel/debug/hx711_weight/calibration    # 当前校准系数
+ *   cat /sys/kernel/debug/hx711_weight/offset         # 零点偏移
+ *   cat /sys/kernel/debug/hx711_weight/sample_count   # 累计采样次数
+ *   cat /sys/kernel/debug/hx711_weight/error_count    # 采样失败次数
+ */
+static void weight_debugfs_init(weight_platform_dev_t *dev)
+{
+    dev->debugfs_dir = debugfs_create_dir("hx711_weight", NULL);
+    if (IS_ERR_OR_NULL(dev->debugfs_dir)) {
+        pr_warn("[weight] debugfs init failed\n");
+        dev->debugfs_dir = NULL;
+        return;
+    }
+    debugfs_create_u32("raw_adc",        0444, dev->debugfs_dir, &dev->last_raw_u32);
+    debugfs_create_u32("calibration",    0444, dev->debugfs_dir, (u32 *)&dev->calibration);
+    debugfs_create_u32("offset",         0444, dev->debugfs_dir, (u32 *)&dev->offset);
+    debugfs_create_u32("low_threshold",  0444, dev->debugfs_dir, (u32 *)&dev->low_threshold);
+    debugfs_create_u32("current_weight", 0444, dev->debugfs_dir, (u32 *)&dev->current_weight);
+    debugfs_create_atomic_t("sample_count", 0444, dev->debugfs_dir, &dev->sample_count);
+    debugfs_create_atomic_t("error_count",  0444, dev->debugfs_dir, &dev->error_count);
+    pr_info("[weight] debugfs ready: /sys/kernel/debug/hx711_weight/\n");
+}
+
+static void weight_debugfs_remove(weight_platform_dev_t *dev)
+{
+    if (dev->debugfs_dir)
+        debugfs_remove_recursive(dev->debugfs_dir);
 }
 
 /************************ 字符设备操作集 ************************/
@@ -155,14 +193,13 @@ static ssize_t weight_read(struct file *filp, char __user *buf, size_t count, lo
     int weight;
 
     if (!dev) return -EIO;
-    
+
     weight = weight_get();
     if (weight < 0) return -EIO;
 
     snprintf(weight_buf, sizeof(weight_buf), "%d\n", weight);
-    if (copy_to_user(buf, weight_buf, strlen(weight_buf))) {
+    if (copy_to_user(buf, weight_buf, strlen(weight_buf)))
         return -EFAULT;
-    }
 
     return strlen(weight_buf);
 }
@@ -175,9 +212,8 @@ static ssize_t weight_write(struct file *filp, const char __user *buf, size_t co
 
     if (!dev) return -EIO;
 
-    if (copy_from_user(cmd_buf, buf, min(count, sizeof(cmd_buf)-1))) {
+    if (copy_from_user(cmd_buf, buf, min(count, sizeof(cmd_buf)-1)))
         return -EFAULT;
-    }
 
     if (strcmp(cmd_buf, "ZERO") == 0) {
         weight_calib_zero(dev);
@@ -220,25 +256,17 @@ static int weight_parse_dts(weight_platform_dev_t *dev)
         return -EINVAL;
     }
 
-    dev->gpio_dt = of_get_named_gpio(dev->nd, "weight-dt-gpios", 0);
+    dev->gpio_dt  = of_get_named_gpio(dev->nd, "weight-dt-gpios", 0);
     dev->gpio_sck = of_get_named_gpio(dev->nd, "weight-sck-gpios", 0);
     if (!gpio_is_valid(dev->gpio_dt) || !gpio_is_valid(dev->gpio_sck)) {
         pr_err("[weight] get gpio failed | dt:%d, sck:%d\n", dev->gpio_dt, dev->gpio_sck);
         return -EINVAL;
     }
-    pr_info("[weight] get gpio: dt=%d, sck=%d\n", dev->gpio_dt, dev->gpio_sck);
 
     ret = gpio_request(dev->gpio_dt, "weight-dt");
-    if (ret < 0) {
-        pr_err("[weight] request gpio dt failed: %d\n", ret);
-        return ret;
-    }
+    if (ret < 0) { pr_err("[weight] request dt gpio failed\n"); return ret; }
     ret = gpio_request(dev->gpio_sck, "weight-sck");
-    if (ret < 0) {
-        pr_err("[weight] request gpio sck failed: %d\n", ret);
-        gpio_free(dev->gpio_dt);
-        return ret;
-    }
+    if (ret < 0) { gpio_free(dev->gpio_dt); return ret; }
 
     gpio_direction_input(dev->gpio_dt);
     gpio_direction_output(dev->gpio_sck, 0);
@@ -254,7 +282,6 @@ static int weight_parse_dts(weight_platform_dev_t *dev)
 
     pr_info("[weight] params: cali=%d, offset=%d, threshold=%d\n",
             dev->calibration, dev->offset, dev->low_threshold);
-
     return 0;
 }
 
@@ -267,53 +294,36 @@ static int weight_platform_probe(struct platform_device *pdev)
     pr_info("[weight] platform probe start\n");
 
     dev = kzalloc(sizeof(weight_platform_dev_t), GFP_KERNEL);
-    if (!dev) {
-        pr_err("[weight] alloc dev data failed\n");
-        return -ENOMEM;
-    }
+    if (!dev) return -ENOMEM;
+
     dev->pdev = pdev;
     mutex_init(&dev->mutex);
+    atomic_set(&dev->sample_count, 0);
+    atomic_set(&dev->error_count, 0);
     weight_dev = dev;
 
     ret = weight_parse_dts(dev);
-    if (ret < 0) {
-        pr_err("[weight] parse dts failed: %d\n", ret);
-        kfree(dev);
-        return ret;
-    }
+    if (ret < 0) { kfree(dev); return ret; }
 
     ret = alloc_chrdev_region(&dev->devid, WEIGHT_DEV_MINOR, WEIGHT_DEV_COUNT, WEIGHT_DEV_NAME);
-    if (ret < 0) {
-        pr_err("[weight] alloc devid failed: %d\n", ret);
-        goto err_alloc;
-    }
-    pr_info("[weight] devid: major=%d, minor=%d\n", MAJOR(dev->devid), MINOR(dev->devid));
+    if (ret < 0) { pr_err("[weight] alloc devid failed\n"); goto err_alloc; }
 
     cdev_init(&dev->cdev, &weight_fops);
     dev->cdev.owner = THIS_MODULE;
     ret = cdev_add(&dev->cdev, dev->devid, WEIGHT_DEV_COUNT);
-    if (ret < 0) {
-        pr_err("[weight] add cdev failed: %d\n", ret);
-        goto err_cdev;
-    }
+    if (ret < 0) { pr_err("[weight] cdev_add failed\n"); goto err_cdev; }
 
     dev->class = class_create(THIS_MODULE, "weight_platform_class");
-    if (IS_ERR(dev->class)) {
-        ret = PTR_ERR(dev->class);
-        pr_err("[weight] create class failed: %d\n", ret);
-        goto err_class;
-    }
+    if (IS_ERR(dev->class)) { ret = PTR_ERR(dev->class); goto err_class; }
 
     dev->device = device_create(dev->class, &pdev->dev, dev->devid, NULL, WEIGHT_DEV_NAME);
-    if (IS_ERR(dev->device)) {
-        ret = PTR_ERR(dev->device);
-        pr_err("[weight] create device failed: %d\n", ret);
-        goto err_device;
-    }
+    if (IS_ERR(dev->device)) { ret = PTR_ERR(dev->device); goto err_device; }
 
     platform_set_drvdata(pdev, dev);
-
     weight_get();
+
+    /* 注册 Debugfs 接口，导出 ADC 原始值、校准参数、采样统计供运行时诊断 */
+    weight_debugfs_init(dev);
 
     pr_info("[weight] platform probe success | dev: /dev/%s\n", WEIGHT_DEV_NAME);
     return 0;
@@ -338,6 +348,7 @@ static int weight_platform_remove(struct platform_device *pdev)
     pr_info("[weight] platform remove start\n");
 
     if (dev) {
+        weight_debugfs_remove(dev);
         device_destroy(dev->class, dev->devid);
         class_destroy(dev->class);
         cdev_del(&dev->cdev);
@@ -347,7 +358,6 @@ static int weight_platform_remove(struct platform_device *pdev)
         kfree(dev);
     }
     weight_dev = NULL;
-
     pr_info("[weight] platform remove success\n");
     return 0;
 }
@@ -365,7 +375,7 @@ static struct platform_driver weight_platform_driver = {
         .of_match_table = weight_of_match,
         .owner = THIS_MODULE,
     },
-    .probe = weight_platform_probe,
+    .probe  = weight_platform_probe,
     .remove = weight_platform_remove,
 };
 
@@ -383,6 +393,6 @@ module_init(weight_drv_init);
 module_exit(weight_drv_exit);
 
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("IMX6U Weight Sensor Driver (32-bit version)");
+MODULE_DESCRIPTION("IMX6U HX711 Weight Sensor Driver with Debugfs");
 MODULE_AUTHOR("Developer");
-MODULE_VERSION("V2.0");
+MODULE_VERSION("V3.0");

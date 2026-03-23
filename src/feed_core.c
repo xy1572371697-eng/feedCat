@@ -1,4 +1,5 @@
 #include "feed_core.h"
+#include "event_loop.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -76,6 +77,9 @@ struct feeder_context {
     pthread_mutex_t lock;
     pthread_mutex_t timer_lock;
     pthread_mutex_t history_lock;
+
+    // Epoll 事件驱动循环（替代 sleep(1) 轮询）
+    event_loop_t *evloop;
 };
 
 // 全局上下文指针（用于回调）
@@ -208,6 +212,55 @@ static void* timer_monitor_thread_func(void *arg) {
     return NULL;
 }
 
+/* ==================== Epoll 事件回调 ==================== */
+
+/**
+ * timerfd 每秒触发一次，替代原 timer_monitor_thread_func 中的 sleep(1)
+ * 完成定时任务检测和今日统计重置
+ */
+static void on_timer_tick(sensor_event_t *evt, void *userdata)
+{
+    (void)evt;
+    feeder_context_t *ctx = (feeder_context_t *)userdata;
+    time_t now = time(NULL);
+    struct tm *tm_now = localtime(&now);
+
+    pthread_mutex_lock(&ctx->timer_lock);
+    for (int i = 0; i < ctx->task_count; i++) {
+        timer_task_t *task = &ctx->timer_tasks[i];
+        if (!task->enabled) continue;
+        if (tm_now->tm_hour == task->hour &&
+            tm_now->tm_min  == task->minute &&
+            tm_now->tm_sec  <  2) {
+            printf("[事件] 触发定时任务 ID=%d: %02d:%02d 喂食%d克\n",
+                   task->id, task->hour, task->minute, task->feed_amount);
+            if (ctx->user_timer_cb) {
+                ctx->user_timer_cb(task, ctx->timer_userdata);
+            } else {
+                pthread_mutex_unlock(&ctx->timer_lock);
+                feeder_feed_auto(ctx, task->feed_amount);
+                pthread_mutex_lock(&ctx->timer_lock);
+            }
+        }
+    }
+    pthread_mutex_unlock(&ctx->timer_lock);
+
+    reset_today_stats(ctx);
+}
+
+/**
+ * IR 传感器 fd 可读时触发，实现 <10ms 低延迟遮挡检测
+ */
+static void on_ir_event(sensor_event_t *evt, void *userdata)
+{
+    feeder_context_t *ctx = (feeder_context_t *)userdata;
+    int obstacle = (int)evt->value;
+    if (obstacle) {
+        printf("[事件] 红外检测到遮挡，触发状态回调\n");
+        trigger_status_callback(ctx);
+    }
+}
+
 /**
  * 自动保存状态到文件
  */
@@ -283,13 +336,31 @@ feeder_context_t* feeder_init(void) {
     ctx->timer_running = 1;
     memset(ctx->timer_tasks, 0, sizeof(ctx->timer_tasks));
     
-    // 启动定时器监控线程
-    if (pthread_create(&ctx->timer_monitor_thread, NULL,
-                       timer_monitor_thread_func, ctx) != 0) {
-        printf("[错误] 无法创建定时器监控线程\n");
+    // 启动 Epoll + 线程池事件循环（替代 sleep(1) 轮询）
+    ctx->evloop = event_loop_create(3);
+    if (ctx->evloop) {
+        // 注册 timerfd（每秒触发，替代 timer_monitor_thread_func 的 sleep(1)）
+        event_loop_add_sensor(ctx->evloop, NULL, EVT_TIMER_TICK,
+                              on_timer_tick, ctx);
+        // 注册红外传感器（边沿触发，<10ms 响应）
+        if (ctx->ir) {
+            event_loop_add_sensor(ctx->evloop, "/dev/ir_obstacle",
+                                  EVT_IR_OBSTACLE, on_ir_event, ctx);
+        }
+        event_loop_start(ctx->evloop);
+        // evloop 已接管定时任务检测，无需旧轮询线程
         ctx->timer_running = 0;
+    } else {
+        // evloop 创建失败，回退到原始轮询线程
+        printf("[警告] event_loop 创建失败，回退到 sleep(1) 轮询\n");
+        ctx->timer_running = 1;
+        if (pthread_create(&ctx->timer_monitor_thread, NULL,
+                           timer_monitor_thread_func, ctx) != 0) {
+            printf("[错误] 无法创建定时器监控线程\n");
+            ctx->timer_running = 0;
+        }
     }
-    
+
     // 6. 视频流默认配置
     ctx->video_port = DEFAULT_VIDEO_PORT;
     ctx->video_quality = DEFAULT_JPEG_QUALITY;
@@ -318,8 +389,11 @@ void feeder_deinit(feeder_context_t *ctx) {
     
     printf("\n正在关闭喂食器系统...\n");
     
-    // 1. 停止定时器监控线程
-    if (ctx->timer_running) {
+    // 1. 停止事件循环 / 定时器监控线程
+    if (ctx->evloop) {
+        event_loop_destroy(ctx->evloop);
+        ctx->evloop = NULL;
+    } else if (ctx->timer_running) {
         ctx->timer_running = 0;
         pthread_join(ctx->timer_monitor_thread, NULL);
     }

@@ -1,1 +1,0 @@
-cmd_/home/xy/linux/feedCat/driver/HX711.ko := arm-linux-gnueabihf-ld -EL -r  -T ./scripts/module-common.lds --build-id  -o /home/xy/linux/feedCat/driver/HX711.ko /home/xy/linux/feedCat/driver/HX711.o /home/xy/linux/feedCat/driver/HX711.mod.o
