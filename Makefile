@@ -68,7 +68,7 @@ SOURCES       = qt/main.cpp \
 		src/video_stream.c \
 		src/rtc_timer.c \
 		src/aht30.c \
-		src/event_loop.c moc/moc_mainwindow.cpp \
+		moc/moc_mainwindow.cpp \
 		moc/moc_feedpage.cpp \
 		moc/moc_timerpage.cpp \
 		moc/moc_historypage.cpp \
@@ -91,7 +91,6 @@ OBJECTS       = obj/main.o \
 		obj/video_stream.o \
 		obj/rtc_timer.o \
 		obj/aht30.o \
-		obj/event_loop.o \
 		obj/moc_mainwindow.o \
 		obj/moc_feedpage.o \
 		obj/moc_timerpage.o \
@@ -630,9 +629,6 @@ obj/feed_core.o: src/feed_core.c include/feed_core.h \
 		include/video_stream.h \
 		include/event_loop.h
 	$(CC) -c $(CFLAGS) $(INCPATH) -o obj/feed_core.o src/feed_core.c
-
-obj/event_loop.o: src/event_loop.c include/event_loop.h
-	$(CC) -c $(CFLAGS) $(INCPATH) -o obj/event_loop.o src/event_loop.c
 
 obj/ir_sensor.o: src/ir_sensor.c include/ir_sensor.h
 	$(CC) -c $(CFLAGS) $(INCPATH) -o obj/ir_sensor.o src/ir_sensor.c

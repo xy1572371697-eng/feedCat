@@ -7,7 +7,7 @@
 #include <linux/spinlock.h>
 
 /*
- * feedcat_kprobes.c - 基于 Kprobes 的驱动性能诊断模块
+ * feedcat_kprobes.c - 基于 Kretprobes 的驱动性能诊断模块
  *
  * 功能：
  *   1. 挂载 i2c_transfer，量化 AHT30 每次 I2C 总线传输耗时（微秒）
@@ -25,64 +25,83 @@
  *   rmmod feedcat_kprobes
  */
 
+/* 每个 kretprobe 实例私有数据：记录函数入口时间戳 */
+struct probe_data {
+    ktime_t entry_time;
+};
+
 /* ==================== i2c_transfer 统计 ==================== */
-static ktime_t  i2c_entry_time;
 static u32      i2c_last_us   = 0;
 static u32      i2c_max_us    = 0;
 static atomic_t i2c_call_count = ATOMIC_INIT(0);
 static DEFINE_SPINLOCK(i2c_lock);
 
-static int i2c_pre(struct kprobe *p, struct pt_regs *regs)
+/* entry handler：函数被调用时触发，记录时间戳到实例私有 data */
+static int i2c_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
-    i2c_entry_time = ktime_get();
+    struct probe_data *data = (struct probe_data *)ri->data;
+    data->entry_time = ktime_get();
     return 0;
 }
 
-static void i2c_post(struct kprobe *p, struct pt_regs *regs, unsigned long flags)
+/* return handler：函数返回时触发，计算耗时 */
+static int i2c_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
-    u32 us = (u32)ktime_to_us(ktime_sub(ktime_get(), i2c_entry_time));
+    struct probe_data *data = (struct probe_data *)ri->data;
+    u32 us = (u32)ktime_to_us(ktime_sub(ktime_get(), data->entry_time));
     unsigned long f;
+
     spin_lock_irqsave(&i2c_lock, f);
     i2c_last_us = us;
-    if (us > i2c_max_us) i2c_max_us = us;
+    if (us > i2c_max_us)
+        i2c_max_us = us;
     spin_unlock_irqrestore(&i2c_lock, f);
     atomic_inc(&i2c_call_count);
+    return 0;
 }
 
-static struct kprobe kp_i2c = {
-    .symbol_name  = "i2c_transfer",
-    .pre_handler  = i2c_pre,
-    .post_handler = i2c_post,
+static struct kretprobe krp_i2c = {
+    .kp.symbol_name = "i2c_transfer",
+    .entry_handler  = i2c_entry,
+    .handler        = i2c_ret,
+    .data_size      = sizeof(struct probe_data),
+    .maxactive      = 8,  /* 最多同时追踪 8 个并发调用 */
 };
 
 /* ==================== weight_get 统计 ==================== */
-static ktime_t  weight_entry_time;
 static u32      weight_last_us    = 0;
 static u32      weight_max_us     = 0;
 static atomic_t weight_call_count = ATOMIC_INIT(0);
 static DEFINE_SPINLOCK(weight_lock);
 
-static int weight_pre(struct kprobe *p, struct pt_regs *regs)
+static int weight_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
-    weight_entry_time = ktime_get();
+    struct probe_data *data = (struct probe_data *)ri->data;
+    data->entry_time = ktime_get();
     return 0;
 }
 
-static void weight_post(struct kprobe *p, struct pt_regs *regs, unsigned long flags)
+static int weight_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
-    u32 us = (u32)ktime_to_us(ktime_sub(ktime_get(), weight_entry_time));
+    struct probe_data *data = (struct probe_data *)ri->data;
+    u32 us = (u32)ktime_to_us(ktime_sub(ktime_get(), data->entry_time));
     unsigned long f;
+
     spin_lock_irqsave(&weight_lock, f);
     weight_last_us = us;
-    if (us > weight_max_us) weight_max_us = us;
+    if (us > weight_max_us)
+        weight_max_us = us;
     spin_unlock_irqrestore(&weight_lock, f);
     atomic_inc(&weight_call_count);
+    return 0;
 }
 
-static struct kprobe kp_weight = {
-    .symbol_name  = "weight_get",
-    .pre_handler  = weight_pre,
-    .post_handler = weight_post,
+static struct kretprobe krp_weight = {
+    .kp.symbol_name = "weight_get",
+    .entry_handler  = weight_entry,
+    .handler        = weight_ret,
+    .data_size      = sizeof(struct probe_data),
+    .maxactive      = 4,
 };
 
 /* ==================== Debugfs ==================== */
@@ -92,13 +111,13 @@ static void kprobes_debugfs_init(void)
 {
     dbg_dir = debugfs_create_dir("feedcat_kprobes", NULL);
     if (IS_ERR_OR_NULL(dbg_dir)) { dbg_dir = NULL; return; }
-    debugfs_create_u32("i2c_last_us",          0444, dbg_dir, &i2c_last_us);
-    debugfs_create_u32("i2c_max_us",           0444, dbg_dir, &i2c_max_us);
-    debugfs_create_atomic_t("i2c_call_count",  0444, dbg_dir, &i2c_call_count);
-    debugfs_create_u32("weight_last_us",        0444, dbg_dir, &weight_last_us);
-    debugfs_create_u32("weight_max_us",         0444, dbg_dir, &weight_max_us);
-    debugfs_create_atomic_t("weight_call_count",0444, dbg_dir, &weight_call_count);
-    pr_info("[kprobes] debugfs: /sys/kernel/debug/feedcat_kprobes/\n");
+    debugfs_create_u32("i2c_last_us",           0444, dbg_dir, &i2c_last_us);
+    debugfs_create_u32("i2c_max_us",            0444, dbg_dir, &i2c_max_us);
+    debugfs_create_atomic_t("i2c_call_count",   0444, dbg_dir, &i2c_call_count);
+    debugfs_create_u32("weight_last_us",         0444, dbg_dir, &weight_last_us);
+    debugfs_create_u32("weight_max_us",          0444, dbg_dir, &weight_max_us);
+    debugfs_create_atomic_t("weight_call_count", 0444, dbg_dir, &weight_call_count);
+    pr_info("[kretprobes] debugfs: /sys/kernel/debug/feedcat_kprobes/\n");
 }
 
 /* ==================== 模块入口/出口 ==================== */
@@ -106,36 +125,37 @@ static int __init feedcat_kprobes_init(void)
 {
     int ret;
 
-    ret = register_kprobe(&kp_i2c);
+    ret = register_kretprobe(&krp_i2c);
     if (ret < 0) {
-        pr_err("[kprobes] register i2c_transfer failed: %d\n", ret);
+        pr_err("[kretprobes] register i2c_transfer failed: %d\n", ret);
         return ret;
     }
-    pr_info("[kprobes] i2c_transfer kprobe planted @ %p\n", kp_i2c.addr);
+    pr_info("[kretprobes] i2c_transfer kretprobe planted @ %p\n", krp_i2c.kp.addr);
 
-    ret = register_kprobe(&kp_weight);
+    ret = register_kretprobe(&krp_weight);
     if (ret < 0)
-        pr_warn("[kprobes] weight_get kprobe skipped (not exported): %d\n", ret);
+        pr_warn("[kretprobes] weight_get kretprobe skipped (not exported): %d\n", ret);
     else
-        pr_info("[kprobes] weight_get kprobe planted @ %p\n", kp_weight.addr);
+        pr_info("[kretprobes] weight_get kretprobe planted @ %p\n", krp_weight.kp.addr);
 
     kprobes_debugfs_init();
-    pr_info("[kprobes] feedcat_kprobes loaded\n");
+    pr_info("[kretprobes] feedcat_kprobes loaded\n");
     return 0;
 }
 
 static void __exit feedcat_kprobes_exit(void)
 {
-    unregister_kprobe(&kp_i2c);
-    unregister_kprobe(&kp_weight);
-    if (dbg_dir) debugfs_remove_recursive(dbg_dir);
-    pr_info("[kprobes] feedcat_kprobes unloaded\n");
+    unregister_kretprobe(&krp_i2c);
+    unregister_kretprobe(&krp_weight);
+    if (dbg_dir)
+        debugfs_remove_recursive(dbg_dir);
+    pr_info("[kretprobes] feedcat_kprobes unloaded\n");
 }
 
 module_init(feedcat_kprobes_init);
 module_exit(feedcat_kprobes_exit);
 
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("FeedCat Kprobes: I2C and HX711 latency profiler");
+MODULE_DESCRIPTION("FeedCat Kretprobes: I2C and HX711 latency profiler");
 MODULE_AUTHOR("Developer");
-MODULE_VERSION("V1.0");
+MODULE_VERSION("V2.0");
